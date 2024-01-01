@@ -11,8 +11,14 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Binaries directory
+dist/
+
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+
+# Database files
+*.db
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
