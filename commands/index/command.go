@@ -30,6 +30,9 @@ type Index struct {
 	Database string `short:"d" long:"database" description:"Path to the database." required:"true" default:"./dedup.db"`
 	// Bucket is a label that is given to all entries indexed during this run.
 	Bucket string `short:"b" long:"bucket" description:"The bucket to use for indexing the given paths." optional:"true" default:"default"`
+
+	Up   bool `long:"up" description:"Migrate the database up." optional:"true"`
+	Down bool `long:"down" description:"Migrate the database up." optional:"true"`
 }
 
 // Execute is the real implementation of the Version command.
@@ -38,27 +41,36 @@ func (cmd *Index) Execute(args []string) error {
 	slog.Debug("running index command", "paths", cmd.Paths, "database", cmd.Database)
 
 	// open the SQLite3 database
-	db, err := sql.Open("sqlite3", cmd.Database)
+	db, err := sql.Open("sqlite3", cmd.Database+"?_journal=WAL&_timeout=5000&_fk=true")
 	if err != nil {
 		slog.Error("error opening SQLite database", "path", cmd.Database, "error", err)
 		return err
 	}
 	defer db.Close()
 
-	// prepare the migrations
-	driver, err := sqlite3.WithInstance(db, &sqlite3.Config{})
-	if err != nil {
-		slog.Error("error loading SQLite migration driver", "error", err)
-		return err
-	}
-	migration, err := migrate.NewWithDatabaseInstance("file://./migrations", "sqlite3", driver)
-	if err != nil {
-		slog.Error("error creating SQLite migration", "error", err)
-		return err
-	}
-	if err = migration.Up(); err != nil {
-		slog.Error("error applying SQLite migration", "error", err)
-		return err
+	if cmd.Up || cmd.Down && !(cmd.Up && cmd.Down) {
+		// prepare the migrations
+		driver, err := sqlite3.WithInstance(db, &sqlite3.Config{})
+		if err != nil {
+			slog.Error("error loading SQLite migration driver", "error", err)
+			return err
+		}
+		migration, err := migrate.NewWithDatabaseInstance("file://./migrations", "sqlite3", driver)
+		if err != nil {
+			slog.Error("error creating SQLite migration", "error", err)
+			return err
+		}
+		if cmd.Up {
+			if err = migration.Up(); err != nil {
+				slog.Error("error applying SQLite migration up", "error", err)
+				return err
+			}
+		} else if cmd.Down {
+			if err = migration.Down(); err != nil {
+				slog.Error("error applying SQLite migration down", "error", err)
+				return err
+			}
+		}
 	}
 
 	// create the workers' pool
