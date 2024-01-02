@@ -6,7 +6,6 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.17.0
 	github.com/jessevdk/go-flags v1.5.0
 	github.com/mattn/go-sqlite3 v1.14.19
-	github.com/panjf2000/ants/v2 v2.9.0
 )
 
 require (
