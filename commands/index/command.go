@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"io"
 	"io/fs"
-	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,7 +27,9 @@ type Index struct {
 	// Paths is the array of directory paths to scan and index.
 	Paths []string `short:"p" long:"path" description:"The directory path(s) to index." required:"true"`
 	// Database is the path to the database to open/create on disk.
-	Database string `short:"d" long:"directory" description:"Path to the database." required:"true" default:"./dedup.db"`
+	Database string `short:"d" long:"database" description:"Path to the database." required:"true" default:"./dedup.db"`
+	// Bucket is a label that is given to all entries indexed during this run.
+	Bucket string `short:"b" long:"bucket" description:"The bucket to use for indexing the given paths." optional:"true" default:"default"`
 }
 
 // Execute is the real implementation of the Version command.
@@ -36,13 +37,7 @@ func (cmd *Index) Execute(args []string) error {
 	cmd.Init()
 	slog.Debug("running index command", "paths", cmd.Paths, "database", cmd.Database)
 
-	// open the data file; it will be created if it doesn't exist
-	// db, err := bolt.Open(cmd.Database, 0600, &bolt.Options{Timeout: 1 * time.Second})
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// defer db.Close()
-
+	// open the SQLite3 database
 	db, err := sql.Open("sqlite3", cmd.Database)
 	if err != nil {
 		slog.Error("error opening SQLite database", "path", cmd.Database, "error", err)
@@ -50,9 +45,7 @@ func (cmd *Index) Execute(args []string) error {
 	}
 	defer db.Close()
 
-	// sqlStmt := `
-	// create table entry (hash text not null, path text, size int);
-	// `
+	// prepare the migrations
 	driver, err := sqlite3.WithInstance(db, &sqlite3.Config{})
 	if err != nil {
 		slog.Error("error loading SQLite migration driver", "error", err)
@@ -60,23 +53,20 @@ func (cmd *Index) Execute(args []string) error {
 	}
 	migration, err := migrate.NewWithDatabaseInstance("file://./migrations", "sqlite3", driver)
 	if err != nil {
-		slog.Error("error creatting SQLite migration", "error", err)
+		slog.Error("error creating SQLite migration", "error", err)
 		return err
 	}
-	migration.Up()
+	if err = migration.Up(); err != nil {
+		slog.Error("error applying SQLite migration", "error", err)
+		return err
+	}
 
 	// create the workers' pool
 	var wg sync.WaitGroup
 	mp, _ := ants.NewMultiPool(10, -1, ants.RoundRobin)
 	defer mp.ReleaseTimeout(5 * time.Second)
-	// for i := 0; i < runTimes; i++ {
-	// 	wg.Add(1)
-	// 	_ = mp.Submit(syncCalculateSum)
-	// }
-	// wg.Wait()
-	// fmt.Printf("running goroutines: %d\n", mp.Running())
-	// fmt.Printf("finish all tasks.\n")
 
+	// now visit the filesystem
 	visit := func(path string, object fs.DirEntry, err error) error {
 		if object.Type().IsDir() {
 			slog.Debug("visit directory", "path", path)
@@ -84,6 +74,7 @@ func (cmd *Index) Execute(args []string) error {
 			slog.Debug("visit regular file", "path", path)
 			wg.Add(1)
 			_ = mp.Submit(func() {
+				defer wg.Done()
 				f, err := os.Open(path)
 				if err != nil {
 					slog.Error("error opening file", "path", path, "error", err)
@@ -104,20 +95,24 @@ func (cmd *Index) Execute(args []string) error {
 
 				tx, err := db.Begin()
 				if err != nil {
-					log.Fatal(err)
+					slog.Error("error opening database transaction", "error", err)
+					return
 				}
-				stmt, err := tx.Prepare("insert into entries(hash, path, size) values(?, ?, ?)")
+				stmt, err := tx.Prepare("insert into entries(hash, path, bucket, size) values(?, ?, ?, ?)")
 				if err != nil {
-					log.Fatal(err)
+					slog.Error("error preparing database insert statement", "error", err)
+					return
 				}
 				defer stmt.Close()
-				_, err = stmt.Exec(path, hash, size)
+				_, err = stmt.Exec(hash, path, cmd.Bucket, size)
 				if err != nil {
-					log.Fatal(err)
+					slog.Error("error executing database insert statement", "error", err)
+					return
 				}
-				err = tx.Commit()
-
-				wg.Done()
+				if err = tx.Commit(); err != nil {
+					slog.Error("error committing database insert transaction", "error", err)
+					return
+				}
 			})
 		} else {
 			slog.Warn("visit object", "path", path, "type", object.Type().String())
