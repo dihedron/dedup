@@ -13,8 +13,6 @@ import (
 	"sync"
 
 	"github.com/dihedron/dedup/commands/base"
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/database/sqlite3"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -31,10 +29,6 @@ type Index struct {
 	Bucket string `short:"b" long:"bucket" description:"The bucket to use for indexing the given paths." optional:"true" default:"default"`
 	// Parallelism represents the number of parallel goroutines to use for digesting files.
 	Parallelism int `long:"parallelism" description:"The number of parallel goroutines to use for digesting files." optional:"true" default:"20"`
-	// Up indicates whether the "up" migrations should be applied first.
-	Up bool `long:"up" description:"Migrate the database up." optional:"true"`
-	// Down indicates whether the "down" migrations should be applied first.
-	Down bool `long:"down" description:"Migrate the database up." optional:"true"`
 }
 
 // Execute is the real implementation of the Version command.
@@ -50,29 +44,20 @@ func (cmd *Index) Execute(args []string) error {
 	}
 	defer db.Close()
 
-	if cmd.Up || cmd.Down && !(cmd.Up && cmd.Down) {
-		// prepare the migrations
-		driver, err := sqlite3.WithInstance(db, &sqlite3.Config{})
-		if err != nil {
-			slog.Error("error loading SQLite migration driver", "error", err)
-			return err
-		}
-		migration, err := migrate.NewWithDatabaseInstance("file://./migrations", "sqlite3", driver)
-		if err != nil {
-			slog.Error("error creating SQLite migration", "error", err)
-			return err
-		}
-		if cmd.Up {
-			if err = migration.Up(); err != nil {
-				slog.Error("error applying SQLite migration up", "error", err)
-				return err
-			}
-		} else if cmd.Down {
-			if err = migration.Down(); err != nil {
-				slog.Error("error applying SQLite migration down", "error", err)
-				return err
-			}
-		}
+	stmt := `
+	CREATE TABLE IF NOT EXISTS entries (
+		hash    TEXT NOT NULL,
+		path    TEXT NOT NULL,
+		bucket  TEXT,
+		size    INT,
+		PRIMARY KEY(hash, path)
+	);
+	CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries (hash);
+	`
+	_, err = db.Exec(stmt)
+	if err != nil {
+		slog.Error("error creating table", "error", err)
+		return err
 	}
 
 	for _, path := range cmd.Paths {
@@ -109,13 +94,45 @@ func (cmd *Index) Execute(args []string) error {
 			}()
 
 			// now loop over the entries as they flow in
-			for r := range entries {
-				if r.err != nil {
-					return r.err
+			for e := range entries {
+				if e.err != nil {
+					slog.Error("error processing entry", "path", e.Path, "error", e.err)
+					continue
+				} else {
+					slog.Info("storing entry into database...", "entry", e.String())
+					err := func(e entry) error {
+						tx, err := db.Begin()
+						if err != nil {
+							// slog.Error("error opening database transaction", "error", err)
+							return err
+						}
+						stmt, err := tx.Prepare("INSERT OR REPLACE INTO entries(hash, path, bucket, size) values(?, ?, ?, ?)")
+						if err != nil {
+							// slog.Error("error preparing database insert statement", "error", err)
+							return err
+						}
+						defer stmt.Close()
+						_, err = stmt.Exec(e.Hash, e.Path, e.Bucket, e.Size)
+						if err != nil {
+							// slog.Error("error executing database insert statement", "error", err)
+							return err
+						}
+						if err = tx.Commit(); err != nil {
+							// slog.Error("error committing database insert transaction", "error", err)
+							return err
+						}
+						return nil
+					}(e)
+					if err != nil {
+						slog.Error("error storing entry into database...", "entry", e.String(), "error", err)
+					} else {
+						slog.Info("entry stored into database...", "entry", e.String())
+					}
 				}
 			}
 			// check whether the walk failed.
-			if err := <-errs; err != nil { // HLerrc
+			if err := <-errs; err != nil {
+				slog.Error("error walking directory tree", "path", path, "error,", err)
 				return err
 			}
 			return nil
@@ -126,139 +143,9 @@ func (cmd *Index) Execute(args []string) error {
 		}
 	}
 
-	/*
-		// create the workers' pool
-		var wg sync.WaitGroup
-		mp, _ := ants.NewMultiPool(10, -1, ants.RoundRobin)
-		defer mp.ReleaseTimeout(5 * time.Second)
-
-		// prepare the channel to enqueue items to be recorded to the database
-		entries := make(chan entry, 1000)
-
-		// prepare the context, so things can be cancelled
-		ctx, cancel := context.WithCancel(context.Background())
-
-		// now visit the filesystem
-		visit := func(path string, object fs.DirEntry, err error) error {
-			if object.Type().IsDir() {
-				slog.Debug("visit directory", "path", path)
-			} else if object.Type().IsRegular() {
-				slog.Debug("visit regular file", "path", path)
-				wg.Add(1)
-				_ = mp.Submit(func() {
-					defer wg.Done()
-
-					if isCancelled(ctx) {
-						slog.Debug("process cancelled, exiting...")
-						return
-					}
-
-					f, err := os.Open(path)
-					if err != nil {
-						slog.Error("error opening file", "path", path, "error", err)
-						return
-					}
-					defer f.Close()
-
-					if isCancelled(ctx) {
-						slog.Debug("process cancelled, exiting...")
-						return
-					}
-
-					var size int64
-					h := sha256.New()
-					if size, err = io.Copy(h, f); err != nil {
-						slog.Error("error reading file", "path", path, "error", err)
-						return
-					}
-
-					if isCancelled(ctx) {
-						slog.Debug("process cancelled, exiting...")
-						return
-					}
-
-					entry := entry{
-						hash:   hex.EncodeToString(h.Sum(nil)),
-						path:   path,
-						bucket: cmd.Bucket,
-						size:   size,
-					}
-					slog.Debug("entry enqueued", "path", path, "entry", entry.String())
-				})
-			} else {
-				slog.Warn("visit object", "path", path, "type", object.Type().String())
-			}
-
-			return nil
-		}
-
-		exit := make(chan os.Signal, 1) // we need to reserve to buffer size 1, so the notifier are not blocked
-		signal.Notify(exit, os.Interrupt, syscall.SIGTERM)
-
-		go func() {
-		outer:
-			for {
-				select {
-				case <-ctx.Done():
-					break outer
-				case entry := <-entries:
-					tx, err := db.Begin()
-					if err != nil {
-						slog.Error("error opening database transaction", "error", err)
-						return
-					}
-					stmt, err := tx.Prepare("insert into entries(hash, path, bucket, size) values(?, ?, ?, ?)")
-					if err != nil {
-						slog.Error("error preparing database insert statement", "error", err)
-						return
-					}
-					defer stmt.Close()
-					_, err = stmt.Exec(entry.hash, entry.path, entry.bucket, entry.size)
-					if err != nil {
-						slog.Error("error executing database insert statement", "error", err)
-						return
-					}
-					if err = tx.Commit(); err != nil {
-						slog.Error("error committing database insert transaction", "error", err)
-						return
-					}
-				case <-exit:
-					slog.Debug("shutting down gracefully by cancelling context")
-					cancel()
-					break outer
-				}
-			}
-		}()
-
-		for _, path := range cmd.Paths {
-			if isCancelled(ctx) {
-				slog.Debug("process cancelled, exiting...")
-				break
-			}
-
-			slog.Debug("visiting directory", "path", path)
-			if err := filepath.WalkDir(path, visit); err != nil {
-				slog.Error("error visiting directory", "path", path, "error", err)
-			}
-		}
-
-		slog.Debug("filepath.WalkDir() returned", "error", err)
-	*/
 	// slog.Debug("command done")
 	return nil
 }
-
-// func isCancelled(ctx context.Context) bool {
-// 	// check if cancelled
-// 	select {
-// 	case <-ctx.Done(): // closes when the caller cancels the ctx
-// 		slog.Debug("process cancelled, exiting...")
-// 		return true
-// 	default:
-// 		slog.Debug("not cancelled, going on...")
-// 		return false
-// 	}
-// }
 
 // visit starts a goroutine to walk the directory tree at root and send the
 // path of each regular file on the string channel; it sends the result of the
@@ -295,10 +182,10 @@ func visit(done <-chan struct{}, root string) (<-chan string, <-chan error) {
 
 // A result is the product of reading and summing a file using MD5.
 type entry struct {
-	path   string
-	hash   string
-	bucket string
-	size   int64
+	Path   string `json:"path"`
+	Hash   string `json:"hash"`
+	Bucket string `json:"bucket"`
+	Size   int64  `json:"size"`
 	err    error
 }
 
