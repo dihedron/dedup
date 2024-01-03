@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"github.com/dihedron/dedup/commands/base"
@@ -21,20 +22,28 @@ import (
 // on disk, in order to check if there are duplicate files on disk, and where they are.
 type Index struct {
 	base.Command
-	// Paths is the array of directory paths to scan and index.
-	Paths []string `short:"p" long:"path" description:"The directory path(s) to index." required:"true"`
+	// Accepts is the array of filename patterns that must be matched for the obejct to be included in the scan.
+	Accepts []string `short:"a" long:"accept" description:"Regular expression that must be matched for the object to be included in the scan." optional:"true"`
+	// Rejects is the array of patterns that, when matched, esclude the object from the scan.
+	Rejects []string `short:"r" long:"reject" description:"Regular expression that, when match, excludes the object from the scan." optional:"true"`
 	// Database is the path to the database to open/create on disk.
 	Database string `short:"d" long:"database" description:"Path to the database." required:"true" default:"./dedup.db"`
 	// Bucket is a label that is given to all entries indexed during this run.
 	Bucket string `short:"b" long:"bucket" description:"The bucket to use for indexing the given paths." optional:"true" default:"default"`
 	// Parallelism represents the number of parallel goroutines to use for digesting files.
-	Parallelism int `long:"parallelism" description:"The number of parallel goroutines to use for digesting files." optional:"true" default:"20"`
+	Parallelism int `short:"p" long:"parallelism" description:"The number of parallel goroutines to use for digesting files." optional:"true" default:"1"`
 }
 
 // Execute is the real implementation of the Version command.
-func (cmd *Index) Execute(args []string) error {
+func (cmd *Index) Execute(paths []string) error {
 	cmd.Init()
-	slog.Debug("running index command", "paths", cmd.Paths, "database", cmd.Database)
+
+	if len(paths) == 0 {
+		slog.Error("no paths provided")
+		return errors.New("no paths provided")
+	}
+
+	slog.Debug("running index command", "paths", paths, "database", cmd.Database)
 
 	// open the SQLite3 database
 	db, err := sql.Open("sqlite3", cmd.Database+"?_journal=WAL&_timeout=5000&_fk=true")
@@ -46,10 +55,12 @@ func (cmd *Index) Execute(args []string) error {
 
 	stmt := `
 	CREATE TABLE IF NOT EXISTS entries (
-		hash    TEXT NOT NULL,
-		path    TEXT NOT NULL,
-		bucket  TEXT,
-		size    INT,
+		hash      TEXT NOT NULL,
+		path      TEXT NOT NULL,
+		dir       TEXT,
+		name      TEXT,
+		bucket    TEXT,
+		size      INT,
 		PRIMARY KEY(hash, path)
 	);
 	CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries (hash);
@@ -60,7 +71,27 @@ func (cmd *Index) Execute(args []string) error {
 		return err
 	}
 
-	for _, path := range cmd.Paths {
+	// `(?i)IMG_\d{0,5}\.jp(?:e*)g`
+	accepts := []*regexp.Regexp{}
+	for _, pattern := range cmd.Accepts {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			slog.Error("error compiling accept regular expression", "pattern", pattern, "error", err)
+			return err
+		}
+		accepts = append(accepts, re)
+	}
+	rejects := []*regexp.Regexp{}
+	for _, pattern := range cmd.Rejects {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			slog.Error("error compiling reject regular expression", "pattern", pattern, "error", err)
+			return err
+		}
+		rejects = append(rejects, re)
+	}
+
+	for _, path := range paths {
 		err := func(path string) error {
 			// the entries channel provides all the entries as they're processed
 			entries := make(chan entry)
@@ -71,7 +102,7 @@ func (cmd *Index) Execute(args []string) error {
 
 			// visit the directories starting at path
 			slog.Debug("starting directory tree visit...", "path", path)
-			paths, errs := visit(done, path)
+			paths, errs := visit(done, path, accepts, rejects)
 
 			// start a fixed number of goroutines to read and digest files
 			var wg sync.WaitGroup
@@ -106,13 +137,14 @@ func (cmd *Index) Execute(args []string) error {
 							// slog.Error("error opening database transaction", "error", err)
 							return err
 						}
-						stmt, err := tx.Prepare("INSERT OR REPLACE INTO entries(hash, path, bucket, size) values(?, ?, ?, ?)")
+						stmt, err := tx.Prepare("INSERT OR REPLACE INTO entries(hash, path, dir, name, bucket, size) values(?, ?, ?, ?, ?, ?)")
 						if err != nil {
 							// slog.Error("error preparing database insert statement", "error", err)
 							return err
 						}
 						defer stmt.Close()
-						_, err = stmt.Exec(e.Hash, e.Path, e.Bucket, e.Size)
+
+						_, err = stmt.Exec(e.Hash, e.Path, filepath.Dir(e.Path), filepath.Base(e.Path), e.Bucket, e.Size)
 						if err != nil {
 							// slog.Error("error executing database insert statement", "error", err)
 							return err
@@ -150,7 +182,7 @@ func (cmd *Index) Execute(args []string) error {
 // visit starts a goroutine to walk the directory tree at root and send the
 // path of each regular file on the string channel; it sends the result of the
 // walk on the error channel; if done is closed, visit abandons its work.
-func visit(done <-chan struct{}, root string) (<-chan string, <-chan error) {
+func visit(done <-chan struct{}, root string, accepts []*regexp.Regexp, rejects []*regexp.Regexp) (<-chan string, <-chan error) {
 	paths := make(chan string)
 	errs := make(chan error, 1)
 	slog.Info("starting directory tree visit in separate goroutine...", "path", root)
@@ -160,18 +192,33 @@ func visit(done <-chan struct{}, root string) (<-chan string, <-chan error) {
 		// no select needed for this send, since errs is buffered.
 		errs <- filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
+				slog.Error("error walking directory tree", "error", err)
 				return err
 			}
-			if !info.Mode().IsRegular() {
+
+			if info.Mode().IsRegular() {
+				for _, accept := range accepts {
+					if !accept.MatchString(path) {
+						slog.Debug("filesystem object skipped because not in accept filter", "path", path, "filter", accept.String())
+						return nil
+					}
+				}
+				for _, reject := range rejects {
+					if reject.MatchString(path) {
+						slog.Debug("filesystem object skipped because in reject filter", "path", path, "filter", reject.String())
+						return nil
+					}
+				}
+				slog.Debug("filesystem object passed the filtering", "path", path)
+				select {
+				case paths <- path:
+					slog.Debug("sending path down the pipeline for further processing...", "path", path)
+				case <-done:
+					slog.Warn("filesystem visit cancelled!", "path", path)
+					return errors.New("walk canceled")
+				}
+			} else {
 				slog.Debug("filesystem object is not a regular file", "path", path)
-				return nil
-			}
-			select {
-			case paths <- path:
-				slog.Debug("sending path down the pipeline for further processing...", "path", path)
-			case <-done:
-				slog.Warn("filesystem visit cancelled!", "path", path)
-				return errors.New("walk canceled")
 			}
 			return nil
 		})

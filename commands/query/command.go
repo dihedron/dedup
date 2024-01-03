@@ -2,10 +2,13 @@ package query
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/dihedron/dedup/commands/base"
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 )
 
 // Query is the command that runs queries against the current database.
@@ -16,9 +19,14 @@ type Query struct {
 }
 
 // Execute is the real implementation of the Version command.
-func (cmd *Query) Execute(args []string) error {
+func (cmd *Query) Execute(queries []string) error {
 	cmd.Init()
-	slog.Debug("running query command", "args", args)
+	slog.Debug("running query command", "queries", queries)
+
+	if len(queries) == 0 {
+		slog.Error("no queries provided")
+		return errors.New("no queries provided")
+	}
 
 	// open the SQLite3 database
 	db, err := sql.Open("sqlite3", cmd.Database+"?_journal=WAL&_timeout=5000&_fk=true")
@@ -28,57 +36,66 @@ func (cmd *Query) Execute(args []string) error {
 	}
 	defer db.Close()
 
-	for _, arg := range args {
-		rows, err := db.Query(arg)
+	for _, query := range queries {
+		rows, err := db.Query(query)
 		if err != nil {
-			slog.Error("error running query", "query", arg, "error", err)
+			slog.Error("error running query", "query", query, "error", err)
 			return err
 		}
 
-		fmt.Println("-----------------------------------")
+		t := table.NewWriter()
+		t.SetTitle("QUERY: " + query)
+		t.Style().Format.Header = text.FormatTitle
+		t.SetAutoIndex(true)
 
-		// Get column names
+		// get column names
 		columns, err := rows.Columns()
 		if err != nil {
-			panic(err.Error()) // proper error handling instead of panic in your app
+			slog.Error("error retrieving columns from query metadata", "error", err)
+			return err
 		}
+		headers := table.Row{}
+		for _, column := range columns {
+			headers = append(headers, column)
+		}
+		t.AppendHeader(headers)
 
-		// Make a slice for the values
+		// make a slice for the values
 		values := make([]sql.RawBytes, len(columns))
 
-		// rows.Scan wants '[]interface{}' as an argument, so we must copy the
+		// rows.Scan wants '[]any' as an argument, so we must copy the
 		// references into such a slice
 		// See http://code.google.com/p/go-wiki/wiki/InterfaceSlice for details
-		scanArgs := make([]interface{}, len(values))
+		scanArgs := make([]any, len(values))
 		for i := range values {
 			scanArgs[i] = &values[i]
 		}
 
-		// Fetch rows
+		// fetch rows
 		for rows.Next() {
 			// get RawBytes from data
 			err = rows.Scan(scanArgs...)
 			if err != nil {
-				panic(err.Error()) // proper error handling instead of panic in your app
+				slog.Error("error retrieving row values from row set", "error", err)
+				return err
 			}
 
-			// Now do something with the data.
-			// Here we just print each column as a string.
-			var value string
+			scanValues := make([]any, len(values))
 			for i, col := range values {
-				// Here we can check if the value is nil (NULL value)
 				if col == nil {
-					value = "NULL"
+					scanValues[i] = "NULL"
 				} else {
-					value = string(col)
+					scanValues[i] = string(col)
 				}
-				fmt.Println(columns[i], ": ", value)
 			}
-			fmt.Println("-----------------------------------")
+			t.AppendRow(scanValues)
 		}
 		if err = rows.Err(); err != nil {
-			panic(err.Error()) // proper error handling instead of panic in your app
+			slog.Error("error reading rows from database", "error", err)
+			return err
 		}
+
+		fmt.Println(t.Render())
 
 	}
 
